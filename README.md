@@ -83,16 +83,46 @@ python tools/autostart.py uninstall   # 取消
 
 **为什么不直接挂 Codex 的钩子**：Codex 的 `config.toml` 只有 `notify`（每轮对话结束时触发），没有启动钩子；它也不支持外部注册启动回调。所以只能由浮窗侧轮询进程。3 秒一次的开销是一次内存快照遍历，微秒级，比每 3 秒调一次 `tasklist` 省得多。
 
+## 多账号切换
+
+右键 → **账号** → 点一个就切过去了。每个账号的用量缓存和预测采样各自独立，不会串。
+
+### 怎么加第二个账号
+
+Codex 同一时间只登录一个账号，多账号靠「一个账号一套配置目录」隔离：
+
+```bat
+set CODEX_HOME=%USERPROFILE%\.codex-work
+codex login
+```
+
+登录完回到浮窗：右键 → 账号 → **重新扫描**，新账号就出现了。
+
+目录名随意，只要以 `.codex` 开头（`.codex-work`、`.codex-alt`…），浮窗会自动扫出来，标签取后缀部分。
+
+### 关于安全，说清楚
+
+你要求「账号密码绝对保存在本地，不上传云端、不传网络」。这个工具的实际行为是：
+
+| 事项 | 实际情况 |
+| --- | --- |
+| 保存账号密码 | **从不**。浮窗没有登录功能，也不需要密码 |
+| 复制 token | **从不**。只读 `auth.json` 里的 `access_token` 用于发请求，不写进任何文件 |
+| 写回 Codex 凭证 | **从不**。不刷新、不修改，避免破坏你的登录态 |
+| 上传到云端 | **没有这个功能**。没有服务器、没有账号体系、没有遥测 |
+| 联网行为 | 只有一种：向 `chatgpt.com` 查额度，直连官方接口 |
+
+**有一点必须说清**：查额度这个动作，本身必须把 token 发到 `chatgpt.com`——否则 OpenAI 无法判断你是谁，也就算不出用量。这是**直连官方接口**，不经过任何第三方服务器，跟「上传到云端」是两件事。如果连这个也不接受，那只能不装这个工具。
+
+浮窗自己唯一写的文件是 `%APPDATA%\CodexGauge\` 下的两个 json：界面设置（位置、透明度、当前账号路径）和用量缓存（百分比数字，不含凭证）。
+
+**切换账号只是换一个读取路径**，凭证始终留在各自的 Codex 目录里，由 Codex 自己管理。
+
 ## 数据从哪来
 
-直接读你本机 Codex CLI 的登录凭证（`~/.codex/auth.json`），调用 ChatGPT 官方用量接口拿实时数据。
+读本机 Codex 的登录凭证（`~/.codex/auth.json`），调用 ChatGPT 官方用量接口拿实时数据。多账号时读的是对应目录的 `auth.json`。
 
-**关于隐私，明确几点：**
-
-- 凭证**只读不写**，绝不修改、不回传、不落盘到别处
-- 不替你刷新 token —— 刷新动作留给 Codex CLI 自己，避免把你的登录态搞坏
-- 只请求一个只读接口，不发送任何额外信息
-- 唯一的本地写入是窗口位置和上次数据缓存，存在 `%APPDATA%\CodexGauge\`
+凭证**只读不写**：不替你刷新 token（刷新留给 Codex CLI 自己做，避免把你的登录态搞坏）、不复制、不落盘到别处。完整的隐私说明见上面「多账号切换 → 关于安全」。
 
 ## 配置
 
@@ -105,7 +135,8 @@ python tools/autostart.py uninstall   # 取消
   "refresh_seconds": 60,     // 刷新间隔（最小 15）
   "pos": null,               // 窗口位置，null = 默认右上角
   "rounded": true,           // 圆角卡片；若渲染异常可改 false
-  "follow_codex": false      // 是否跟随 Codex 显示/隐藏
+  "follow_codex": false,     // 是否跟随 Codex 显示/隐藏
+  "active_account": null     // 当前账号的 Codex 目录路径
 }
 ```
 
@@ -132,7 +163,7 @@ codex-gauge/
 ├─ 启动 Codex 额度浮窗.bat   启动器（双击即可）
 ├─ src/codex_gauge.py        全部源码，单文件
 ├─ tools/autostart.py        开机自启管理（install / status / uninstall）
-├─ tests/test_forecast.py    预测逻辑单测（12 条）
+├─ tests/                    单测：test_forecast（预测 12 条）、test_accounts（多账号 11 条）
 ├─ docs/                     效果图
 ├─ PROJECT.md                项目背景
 ├─ TASKS.md                  待办

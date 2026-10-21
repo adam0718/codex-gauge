@@ -34,6 +34,7 @@ import urllib.request
 from pathlib import Path
 
 import tkinter as tk
+from tkinter import messagebox
 
 # ---------------------------------------------------------------- 常量
 
@@ -81,6 +82,7 @@ DEFAULT_CONFIG = {
     "pos": None,
     "rounded": True,
     "follow_codex": False,
+    "active_account": None,
 }
 
 # ---------------------------------------------------------------- 配置
@@ -113,9 +115,13 @@ class UsageError(Exception):
     pass
 
 
-def _read_auth():
-    """读取 Codex CLI 的登录凭证。只读，绝不修改。"""
-    path = CODEX_HOME / "auth.json"
+def _read_auth(codex_home=None):
+    """读取指定 Codex 目录的登录凭证。
+
+    严格只读：只取 access_token 和 account_id 两个字段，
+    不复制、不改写、不缓存到本项目自己的文件里。
+    """
+    path = (Path(codex_home) if codex_home else CODEX_HOME) / "auth.json"
     if not path.exists():
         raise UsageError("未找到 Codex 登录凭证")
     try:
@@ -130,6 +136,47 @@ def _read_auth():
     return access, account
 
 
+def discover_accounts() -> list:
+    """扫描家目录下的 .codex* 目录，返回其中已登录的账号。
+
+    每个账号 = 一套独立的 Codex 配置目录（各自有 auth.json）。
+    这里只读目录结构和 account_id 用于显示，token 不会被复制到任何地方。
+
+    返回 [{"path", "label", "account_id", "mtime"}]
+    """
+    home = Path.home()
+    found = []
+    try:
+        candidates = sorted(home.glob(".codex*"))
+    except Exception:
+        return found
+
+    for d in candidates:
+        try:
+            if not d.is_dir():
+                continue
+            auth = d / "auth.json"
+            if not auth.exists():
+                continue
+            data = json.loads(auth.read_text(encoding="utf-8"))
+            tokens = data.get("tokens") or {}
+            if not tokens.get("access_token"):
+                continue
+            suffix = d.name[len(".codex"):].lstrip("-_")
+            found.append({
+                "path": str(d),
+                "label": "主账号" if not suffix else suffix,
+                "account_id": tokens.get("account_id") or "",
+                "mtime": auth.stat().st_mtime,
+            })
+        except Exception:
+            continue
+
+    # 主账号排最前，其余按凭证更新时间倒序
+    found.sort(key=lambda a: (a["label"] != "主账号", -a["mtime"]))
+    return found
+
+
 def _jwt_expired(token: str) -> bool:
     try:
         import base64
@@ -142,13 +189,13 @@ def _jwt_expired(token: str) -> bool:
         return False
 
 
-def fetch_usage() -> dict:
+def fetch_usage(codex_home=None) -> dict:
     """拉取一次实时额度。网络/鉴权问题一律抛 UsageError。
 
     网络抖动（TLS 被中途掐断这类）在国内访问 chatgpt.com 时并不罕见，
     所以这里带两次重试；鉴权类错误不重试，重试也没意义。
     """
-    access, account = _read_auth()
+    access, account = _read_auth(codex_home)
 
     if _jwt_expired(access):
         raise UsageError("凭证已过期，请打开一次 Codex")
@@ -216,26 +263,44 @@ def normalize(payload: dict) -> dict:
     }
 
 
-def load_cache():
-    """返回 (data, samples)。兼容旧版只有 data 的缓存文件。"""
+def load_cache(account_path=None):
+    """返回 (data, samples)，按账号隔离，切换账号不会串数据。"""
+    key = str(account_path or CODEX_HOME)
     try:
-        if CACHE_FILE.exists():
-            raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and "data" in raw:
-                return raw.get("data"), raw.get("samples") or {}
-            return raw, {}
+        if not CACHE_FILE.exists():
+            return None, {}
+        raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None, {}
+        if "accounts" in raw:
+            entry = (raw.get("accounts") or {}).get(key) or {}
+            return entry.get("data"), entry.get("samples") or {}
+        # 兼容 v1.0 / v1.1 的单账号格式
+        if "data" in raw:
+            return raw.get("data"), raw.get("samples") or {}
+        return raw, {}
     except Exception:
-        pass
-    return None, {}
+        return None, {}
 
 
-def save_cache(data: dict, samples: dict) -> None:
+def save_cache(data: dict, samples: dict, account_path=None) -> None:
+    key = str(account_path or CODEX_HOME)
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(
-            json.dumps({"data": data, "samples": samples}, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        raw = {}
+        if CACHE_FILE.exists():
+            try:
+                raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                raw = {}
+        if not isinstance(raw, dict) or "accounts" not in raw:
+            # 旧格式迁移：把已有数据归到默认账号名下
+            old = raw if isinstance(raw, dict) and "data" in raw else {}
+            raw = {"accounts": {}}
+            if old:
+                raw["accounts"][str(CODEX_HOME)] = old
+        raw["accounts"][key] = {"data": data, "samples": samples}
+        CACHE_FILE.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -362,7 +427,9 @@ class Gauge:
     def __init__(self, root: tk.Tk, cfg: dict):
         self.root = root
         self.cfg = cfg
-        self.data, self.samples = load_cache()
+        self.accounts = discover_accounts()
+        self.account_path = self._resolve_account()
+        self.data, self.samples = load_cache(self.account_path)
         self.error = None
         self.fetching = False
         self._drag = None
@@ -490,6 +557,16 @@ class Gauge:
         self.menu.add_checkbutton(
             label="跟随 Codex 启动", variable=self.follow_var, command=self._toggle_follow
         )
+
+        self.account_var = tk.StringVar(value=self.account_path)
+        self.account_menu = tk.Menu(
+            self.menu, tearoff=0, bg="#161C26", fg="#DDE5F2",
+            activebackground="#2A3446", activeforeground="#FFFFFF",
+            bd=0, font=("Microsoft YaHei UI", 9),
+        )
+        self._rebuild_account_menu()
+        self.menu.add_cascade(label="账号", menu=self.account_menu)
+
         self.menu.add_separator()
         alpha_menu = tk.Menu(self.menu, tearoff=0, bg="#161C26", fg="#DDE5F2",
                              activebackground="#2A3446", activeforeground="#FFFFFF",
@@ -781,6 +858,73 @@ class Gauge:
             return "safe", None  # 重置先到，打不满
         return "burn", eta
 
+    # -------------------------------------------------- 账号
+
+    def _resolve_account(self) -> str:
+        """启动时用哪个账号：配置里记的 > 扫描到的第一个 > 默认目录。"""
+        saved = self.cfg.get("active_account")
+        if saved and any(a["path"] == saved for a in self.accounts):
+            return saved
+        if self.accounts:
+            return self.accounts[0]["path"]
+        return str(CODEX_HOME)
+
+    def _switch_account(self, path: str):
+        if not path or path == self.account_path:
+            return
+        self.account_path = path
+        self.cfg["active_account"] = path
+        save_config(self.cfg)
+        # 换账号等于换一份数据源，缓存和采样都要跟着切，不能串
+        self.data, self.samples = load_cache(path)
+        self.error = None
+        self._paint_static()
+        self._paint_data()
+        self.refresh()
+
+    def _rescan_accounts(self):
+        before = {a["path"] for a in self.accounts}
+        self.accounts = discover_accounts()
+        after = {a["path"] for a in self.accounts}
+        self._rebuild_account_menu()
+        added = len(after - before)
+        if added:
+            messagebox.showinfo("账号", "发现 %d 个新账号。" % added)
+        else:
+            messagebox.showinfo("账号", "没有发现新账号。\n\n共 %d 个。" % len(self.accounts))
+
+    def _show_account_help(self):
+        messagebox.showinfo(
+            "多账号怎么加",
+            "Codex Gauge 不保存任何账号或密码。\n\n"
+            "多账号靠「每个账号一套独立的 Codex 配置目录」实现：\n\n"
+            "1. 打开命令行，为新账号指定目录并登录：\n"
+            "   set CODEX_HOME=%USERPROFILE%\\.codex-work\n"
+            "   codex login\n\n"
+            "2. 回到浮窗：右键 → 账号 → 重新扫描\n\n"
+            "之后右键菜单里就能直接切换。\n"
+            "切换只是换一个读取路径——凭证始终留在各自的目录里，\n"
+            "浮窗不复制、不上传、不写进自己的配置文件。",
+        )
+
+    def _rebuild_account_menu(self):
+        menu = self.account_menu
+        menu.delete(0, "end")
+        if not self.accounts:
+            menu.add_command(label="（未发现账号）", state="disabled")
+        for acc in self.accounts:
+            short = (acc["account_id"] or "")[:8]
+            label = acc["label"] + ("  " + short if short else "")
+            menu.add_radiobutton(
+                label=label,
+                value=acc["path"],
+                variable=self.account_var,
+                command=lambda p=acc["path"]: self._switch_account(p),
+            )
+        menu.add_separator()
+        menu.add_command(label="重新扫描", command=self._rescan_accounts)
+        menu.add_command(label="如何添加账号…", command=self._show_account_help)
+
     # -------------------------------------------------- 刷新
 
     def refresh(self):
@@ -791,7 +935,7 @@ class Gauge:
 
     def _worker(self):
         try:
-            data = fetch_usage()
+            data = fetch_usage(self.account_path)
             self.root.after(0, lambda: self._on_data(data))
         except UsageError as e:
             self.root.after(0, lambda: self._on_error(str(e)))
@@ -807,7 +951,7 @@ class Gauge:
             win = data.get(key)
             if win:
                 self._record_sample(key, win["used"], now)
-        save_cache(data, self.samples)
+        save_cache(data, self.samples, self.account_path)
         self._paint_static()
         self._paint_data()
 

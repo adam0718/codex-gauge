@@ -130,6 +130,30 @@ codex login
 
 目录名随意，只要以 `.codex` 开头（`.codex-work`、`.codex-alt`…），浮窗会自动扫出来，标签取后缀部分。
 
+### API Key 模式
+
+Codex 支持两种认证方式，写在 `auth.json` 的 `auth_mode` 字段里：
+
+| 模式 | 凭证 | 额度 |
+| --- | --- | --- |
+| `chatgpt` | OAuth 会话 | 有 5H / 7D 滚动窗口 |
+| `apikey` | `OPENAI_API_KEY` | **没有窗口额度**，按 token 计费 |
+
+切到 API Key 模式时，浮窗会如实显示，不编造数字：
+
+```
+● CODEX                    [API-KEY]
+5H  ──────────────────      --
+7D  ──────────────────      --
+    API Key 模式 · 按 token 计费，无窗口额度
+```
+
+账号菜单里也会区分：账号模式显示 `主账号 27946877`，Key 模式显示 `work API Key`。
+
+**为什么 Key 模式没有数字**：5H / 7D 是 ChatGPT 订阅的速率限制窗口。API Key 走按量计费，OpenAI 没给普通 key 提供用量查询接口（要 org admin key 才能查 organization costs）。所以不是不查，是查不到。
+
+**浮窗不会替你切换认证方式**：`auth.json` 只读。想换 key / 账号，在 Codex 里操作，浮窗下一轮刷新（最多 60 秒）会自动跟上。
+
 ### 关于安全，说清楚
 
 你要求「账号密码绝对保存在本地，不上传云端、不传网络」。这个工具的实际行为是：

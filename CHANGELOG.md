@@ -2,6 +2,31 @@
 
 本项目遵循「阶段-版本」记录方式。日期为本地时间。
 
+## [1.5.0] — 2026-10-21
+
+### 新增
+- **API Key 模式识别**：读取 `auth.json` 的 `auth_mode`，区分 `chatgpt`（OAuth）与 `apikey` 两种认证
+  - Key 模式下如实显示「API Key 模式 · 按 token 计费，无窗口额度」，进度条置空，不编造数字
+  - 徽章显示 `API-KEY`（绿色），状态点转灰
+  - 账号菜单区分标注：账号模式显示 account_id 前 8 位，Key 模式显示 `API Key`
+- 修复 Key 模式下原本会误报「请先登录 Codex CLI」的问题
+
+### 关于 Key 模式为什么不显示额度
+5H / 7D 是 ChatGPT 订阅的速率限制窗口；API Key 走按量计费，OpenAI 未给普通 key 提供用量查询接口（需 org admin key 查 organization costs）。不是不查，是查不到。
+
+浮窗也不代用户切换 `auth.json` —— 保持只读，避免破坏 Codex 登录态。在 Codex 里切换后，浮窗下一轮刷新自动跟上。
+
+### 验证记录
+| 项目 | 方法 | 结果 |
+| --- | --- | --- |
+| 模式识别 | 造假 `.codex-keytest`（`auth_mode: apikey`） | `_read_auth` 返回 apikey + key |
+| 数据层 | 调 `fetch_usage` | 返回 mode=apikey，primary/secondary 均为 None，无网络请求 |
+| 账号扫描 | 扫描含 key 账号的目录 | 识别为 apikey 模式并打标 |
+| 界面 | 切到 Key 账号截图 | 徽章 API-KEY、两条 `--`、底部提示正确 |
+| 回归 | 预测 12 条 + 多账号 20 条 | 全部通过 |
+
+---
+
 ## [1.4.0] — 2026-10-21
 
 ### 新增

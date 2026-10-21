@@ -78,6 +78,7 @@ PLAN_COLORS = {
     "business": "#0EA5E9",
     "enterprise": "#0EA5E9",
     "free": "#4B5563",
+    "api-key": "#10A37F",
 }
 
 DEFAULT_CONFIG = {
@@ -122,10 +123,13 @@ class UsageError(Exception):
 
 
 def _read_auth(codex_home=None):
-    """读取指定 Codex 目录的登录凭证。
+    """读取指定 Codex 目录的登录凭证，返回 (模式, 凭证, account_id)。
 
-    严格只读：只取 access_token 和 account_id 两个字段，
-    不复制、不改写、不缓存到本项目自己的文件里。
+    模式有两种，对应 Codex 自己的 auth_mode：
+      "chatgpt" —— OAuth 会话，能查 5H / 7D 额度窗口
+      "apikey"  —— 直接填 OPENAI_API_KEY，按 token 计费，没有窗口额度这回事
+
+    严格只读：只取需要的字段，不复制、不改写、不缓存到本项目自己的文件里。
     """
     path = (Path(codex_home) if codex_home else CODEX_HOME) / "auth.json"
     if not path.exists():
@@ -134,12 +138,21 @@ def _read_auth(codex_home=None):
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         raise UsageError("凭证文件无法解析")
+
+    mode = (data.get("auth_mode") or "").lower()
+    api_key = data.get("OPENAI_API_KEY")
     tokens = data.get("tokens") or {}
     access = tokens.get("access_token")
     account = tokens.get("account_id")
+
+    # 以 auth_mode 为准；没有该字段时按有没有 token 推断
+    if mode == "apikey" or (not mode and api_key and not access):
+        if not api_key:
+            raise UsageError("API Key 模式但没读到 Key")
+        return "apikey", api_key, None
     if not access:
-        raise UsageError("请先登录 Codex CLI")
-    return access, account
+        raise UsageError("请先登录 Codex")
+    return "chatgpt", access, account
 
 
 def discover_accounts() -> list:
@@ -165,14 +178,22 @@ def discover_accounts() -> list:
             if not auth.exists():
                 continue
             data = json.loads(auth.read_text(encoding="utf-8"))
+            mode = (data.get("auth_mode") or "").lower()
             tokens = data.get("tokens") or {}
-            if not tokens.get("access_token"):
+            api_key = data.get("OPENAI_API_KEY")
+            has_oauth = bool(tokens.get("access_token"))
+            if mode == "apikey" or (not mode and api_key and not has_oauth):
+                acc_mode = "apikey"
+            elif has_oauth:
+                acc_mode = "chatgpt"
+            else:
                 continue
             suffix = d.name[len(".codex"):].lstrip("-_")
             found.append({
                 "path": str(d),
                 "label": "主账号" if not suffix else suffix,
                 "account_id": tokens.get("account_id") or "",
+                "mode": acc_mode,
                 "mtime": auth.stat().st_mtime,
             })
         except Exception:
@@ -201,8 +222,22 @@ def fetch_usage(codex_home=None) -> dict:
     网络抖动（TLS 被中途掐断这类）在国内访问 chatgpt.com 时并不罕见，
     所以这里带两次重试；鉴权类错误不重试，重试也没意义。
     """
-    access, account = _read_auth(codex_home)
+    mode, credential, account = _read_auth(codex_home)
 
+    if mode == "apikey":
+        # API Key 按 token 计费，OpenAI 没有给普通 key 提供「窗口额度」查询，
+        # 也不存在 5H / 7D 这种滚动窗口。如实返回模式，不编造数字。
+        return {
+            "mode": "apikey",
+            "plan": "api-key",
+            "primary": None,
+            "secondary": None,
+            "allowed": True,
+            "limit_reached": False,
+            "fetched_at": time.time(),
+        }
+
+    access = credential
     if _jwt_expired(access):
         raise UsageError("凭证已过期，请打开一次 Codex")
 
@@ -260,6 +295,7 @@ def normalize(payload: dict) -> dict:
         raise UsageError("该账号暂无额度信息")
 
     return {
+        "mode": "chatgpt",
         "plan": (payload.get("plan_type") or "").lower() or "unknown",
         "primary": primary,
         "secondary": secondary,
@@ -864,12 +900,17 @@ class Gauge:
         cv.delete("dyn")
         d = self.data
 
-        # 状态点：取两个窗口里更紧张的那个
-        used = max(
-            (d or {}).get("primary", {}).get("used", 0) if d and d.get("primary") else 0,
-            (d or {}).get("secondary", {}).get("used", 0) if d and d.get("secondary") else 0,
-        )
-        cv.itemconfigure(self.dot, fill=level_color(used) if d else C_OFFLINE)
+        # 状态点：取两个窗口里更紧张的那个；API Key 模式没有窗口，用灰点
+        if d and d.get("mode") == "apikey":
+            cv.itemconfigure(self.dot, fill=C_DIM)
+        elif d:
+            used = max(
+                (d.get("primary") or {}).get("used", 0),
+                (d.get("secondary") or {}).get("used", 0),
+            )
+            cv.itemconfigure(self.dot, fill=level_color(used))
+        else:
+            cv.itemconfigure(self.dot, fill=C_OFFLINE)
 
         # 套餐徽章
         plan = ((d or {}).get("plan") or "").upper()
@@ -889,6 +930,8 @@ class Gauge:
 
     def _paint_forecast(self, primary, secondary):
         """预测行：按当前消耗速度，各自的窗口会不会在重置前打满。"""
+        if (self.data or {}).get("mode") == "apikey":
+            return  # API Key 没有窗口，预测无从谈起
         cv = self.canvas
         for tag, key, win, x, anchor in (
             ("5H", "primary", primary, 20, "w"),
@@ -922,12 +965,15 @@ class Gauge:
         elif not d:
             text = "正在读取额度…"
         else:
-            # 「用尽 / 打满」由上面的预测行负责，这里只交代重置时刻，避免重复
-            parts = []
-            for label, w in (("5H", d.get("primary")), ("7D", d.get("secondary"))):
-                if w and w.get("reset_at"):
-                    parts.append("%s %s" % (label, fmt_clock(w["reset_at"])))
-            text = "重置 " + " · ".join(parts) if parts else "额度正常"
+            if d.get("mode") == "apikey":
+                text = "API Key 模式 · 按 token 计费，无窗口额度"
+            else:
+                # 「用尽 / 打满」由上面的预测行负责，这里只交代重置时刻，避免重复
+                parts = []
+                for label, w in (("5H", d.get("primary")), ("7D", d.get("secondary"))):
+                    if w and w.get("reset_at"):
+                        parts.append("%s %s" % (label, fmt_clock(w["reset_at"])))
+                text = "重置 " + " · ".join(parts) if parts else "额度正常"
         self.canvas.itemconfigure(self.foot, text=text, fill=color)
 
     # -------------------------------------------------- 用量预测
@@ -1027,8 +1073,11 @@ class Gauge:
         if not self.accounts:
             menu.add_command(label="（未发现账号）", state="disabled")
         for acc in self.accounts:
-            short = (acc["account_id"] or "")[:8]
-            label = acc["label"] + ("  " + short if short else "")
+            if acc.get("mode") == "apikey":
+                label = acc["label"] + "  API Key"
+            else:
+                short = (acc["account_id"] or "")[:8]
+                label = acc["label"] + ("  " + short if short else "")
             menu.add_radiobutton(
                 label=label,
                 value=acc["path"],

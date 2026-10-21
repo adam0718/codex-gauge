@@ -59,6 +59,30 @@
 
 右键菜单里的「淡出透明度」可以选 40% / 55% / 70% / 85%。
 
+## 跟随 Codex 启动
+
+右键菜单勾选「跟随 Codex 启动」后，浮窗每 3 秒看一眼 Codex 进程：
+
+- Codex 在跑 → 窗口出现
+- Codex 关掉 → 窗口自动收起
+- 再打开 Codex → 窗口自己回来
+
+**前提是浮窗本身得在后台待命**，所以还要装开机自启：
+
+```bash
+python tools/autostart.py install     # 安装
+python tools/autostart.py status      # 查看当前状态
+python tools/autostart.py uninstall   # 取消
+```
+
+安装时优先往「启动」文件夹放脚本，你能在 `shell:startup` 里直接看到并删除。如果这台机器拒绝写入（装了安全软件或开了「受控文件夹访问」的机器会拒），会自动降级到注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，并在输出里明确告诉你用了哪种。
+
+> 本机实测：启动文件夹写入被系统拦截，实际落在注册表。要撤销就运行上面的 `uninstall`，不用自己去翻注册表。
+
+**窗口不见了怎么找回来**：再双击一次 `启动 Codex 额度浮窗.bat`。程序发现已有实例时，会让它显形并自动关掉跟随模式——不会把你锁在窗口外面。
+
+**为什么不直接挂 Codex 的钩子**：Codex 的 `config.toml` 只有 `notify`（每轮对话结束时触发），没有启动钩子；它也不支持外部注册启动回调。所以只能由浮窗侧轮询进程。3 秒一次的开销是一次内存快照遍历，微秒级，比每 3 秒调一次 `tasklist` 省得多。
+
 ## 数据从哪来
 
 直接读你本机 Codex CLI 的登录凭证（`~/.codex/auth.json`），调用 ChatGPT 官方用量接口拿实时数据。
@@ -80,7 +104,8 @@
   "hover_alpha": 1.0,        // 鼠标悬停时
   "refresh_seconds": 60,     // 刷新间隔（最小 15）
   "pos": null,               // 窗口位置，null = 默认右上角
-  "rounded": true            // 圆角卡片；若渲染异常可改 false
+  "rounded": true,           // 圆角卡片；若渲染异常可改 false
+  "follow_codex": false      // 是否跟随 Codex 显示/隐藏
 }
 ```
 
@@ -106,6 +131,8 @@
 codex-gauge/
 ├─ 启动 Codex 额度浮窗.bat   启动器（双击即可）
 ├─ src/codex_gauge.py        全部源码，单文件
+├─ tools/autostart.py        开机自启管理（install / status / uninstall）
+├─ tests/test_forecast.py    预测逻辑单测（12 条）
 ├─ docs/                     效果图
 ├─ PROJECT.md                项目背景
 ├─ TASKS.md                  待办

@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "refresh_seconds": 60,
     "pos": None,
     "rounded": True,
+    "follow_codex": False,
 }
 
 # ---------------------------------------------------------------- 配置
@@ -304,6 +305,56 @@ def fmt_clock(ts: float) -> str:
         return "--"
 
 
+# ---------------------------------------------------------------- 进程探测
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.wintypes.DWORD),
+        ("cntUsage", ctypes.wintypes.DWORD),
+        ("th32ProcessID", ctypes.wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", ctypes.wintypes.DWORD),
+        ("cntThreads", ctypes.wintypes.DWORD),
+        ("th32ParentProcessID", ctypes.wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szExeFile", ctypes.wintypes.WCHAR * 260),
+    ]
+
+
+def codex_running() -> bool:
+    """Codex 桌面应用是否在运行。
+
+    用进程快照而不是 tasklist 子进程：后者每次要起一个控制台进程，
+    每 3 秒调一次太浪费。快照遍历是纯内存操作，微秒级。
+    """
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = ctypes.c_void_p(-1).value
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+    k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID:
+        return True  # 探测失败时别误判成"没在跑"，否则窗口会莫名消失
+
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+    try:
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() in ("codex.exe", "codex"):
+                return True
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+        return False
+    finally:
+        k32.CloseHandle(snap)
+
+
 # ---------------------------------------------------------------- 窗口
 
 
@@ -318,6 +369,8 @@ class Gauge:
         self._idle_job = None
         self._tick_job = None
         self._refresh_job = None
+        self._watch_job = None
+        self._hidden = False
 
         self._hwnd = None
         self._layered = False
@@ -331,6 +384,7 @@ class Gauge:
         self.refresh()
         self._schedule_refresh()
         self._tick()
+        self.root.after(200, self._watch_codex)
 
     # -------------------------------------------------- 窗口骨架
 
@@ -432,6 +486,10 @@ class Gauge:
                             bd=0, font=("Microsoft YaHei UI", 9))
         self.menu.add_command(label="立即刷新", command=self.refresh)
         self.menu.add_command(label="重置位置", command=self._reset_pos)
+        self.follow_var = tk.BooleanVar(value=bool(self.cfg.get("follow_codex")))
+        self.menu.add_checkbutton(
+            label="跟随 Codex 启动", variable=self.follow_var, command=self._toggle_follow
+        )
         self.menu.add_separator()
         alpha_menu = tk.Menu(self.menu, tearoff=0, bg="#161C26", fg="#DDE5F2",
                              activebackground="#2A3446", activeforeground="#FFFFFF",
@@ -504,6 +562,64 @@ class Gauge:
         self.cfg["idle_alpha"] = v
         save_config(self.cfg)
         self._maybe_idle()
+
+    # -------------------------------------------------- 跟随 Codex
+
+    def _watch_codex(self):
+        """每 3 秒看一次 Codex 在不在：在就露出来，不在就收起来。"""
+        try:
+            if self.cfg.get("follow_codex"):
+                running = codex_running()
+                if running and self._hidden:
+                    self._show_window()
+                elif not running and not self._hidden:
+                    self._hide_window()
+        except Exception:
+            pass
+        self._watch_job = self.root.after(3000, self._watch_codex)
+
+    def _hide_window(self):
+        self.root.withdraw()
+        self._hidden = True
+
+    def _show_window(self):
+        self.root.deiconify()
+        self._hidden = False
+
+        def sync_alpha():
+            # withdraw / deiconify 之后分层属性可能被重置，这里按鼠标位置补一次
+            try:
+                px, py = self.root.winfo_pointerxy()
+                x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+                w, h = self.root.winfo_width(), self.root.winfo_height()
+                inside = x <= px < x + w and y <= py < y + h
+            except Exception:
+                inside = False
+            self.set_alpha(self.cfg["hover_alpha"] if inside else self.cfg["idle_alpha"])
+
+        self.root.after(60, sync_alpha)
+
+    def _toggle_follow(self):
+        on = bool(self.follow_var.get())
+        self.cfg["follow_codex"] = on
+        save_config(self.cfg)
+        if not on and self._hidden:
+            self._show_window()
+
+    def _force_show(self):
+        """被第二次启动唤起时：关掉跟随并显示，免得用户被锁在窗口外。"""
+        self.cfg["follow_codex"] = False
+        save_config(self.cfg)
+        try:
+            self.follow_var.set(False)
+        except Exception:
+            pass
+        if self._hidden:
+            self._show_window()
+        try:
+            self.root.lift()
+        except Exception:
+            pass
 
     def _quit(self):
         self.cfg["pos"] = [self.root.winfo_x(), self.root.winfo_y()]
@@ -728,13 +844,40 @@ class Gauge:
 
 
 def _single_instance() -> bool:
+    """True = 本进程是主实例；False = 已有实例（已顺手通知它显示出来）。"""
     global _LOCK_SOCKET
     try:
         _LOCK_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _LOCK_SOCKET.bind(("127.0.0.1", 49731))
+        _LOCK_SOCKET.listen(1)
         return True
     except OSError:
+        # 已经有一个在跑。让它显形并退出跟随模式——否则跟随开启且 Codex 没开时，
+        # 窗口是隐藏的，用户会以为程序坏了，再点也没反应。
+        try:
+            conn = socket.create_connection(("127.0.0.1", 49731), timeout=2)
+            conn.sendall(b"show")
+            conn.close()
+        except Exception:
+            pass
         return False
+
+
+def _serve_show_requests(gauge: "Gauge") -> None:
+    """主实例监听「把我叫出来」的请求。"""
+
+    def loop():
+        while True:
+            try:
+                conn, _ = _LOCK_SOCKET.accept()
+                data = conn.recv(32)
+                conn.close()
+                if data.strip() == b"show":
+                    gauge.root.after(0, gauge._force_show)
+            except Exception:
+                break
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def main():
@@ -742,7 +885,8 @@ def main():
         return
     cfg = load_config()
     root = tk.Tk()
-    Gauge(root, cfg)
+    gauge = Gauge(root, cfg)
+    _serve_show_requests(gauge)
     root.mainloop()
 
 

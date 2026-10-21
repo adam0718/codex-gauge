@@ -44,8 +44,8 @@ CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_FILE = CONFIG_DIR / "cache.json"
 
-WIN_W, WIN_H = 250, 124
-CARD = (6, 6, 244, 118)
+WIN_W, WIN_H = 252, 142
+CARD = (6, 6, 246, 136)
 CARD_R = 14
 
 # 魔术色：圆角之外的所有像素都会被系统抠掉
@@ -216,18 +216,25 @@ def normalize(payload: dict) -> dict:
 
 
 def load_cache():
+    """返回 (data, samples)。兼容旧版只有 data 的缓存文件。"""
     try:
         if CACHE_FILE.exists():
-            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and "data" in raw:
+                return raw.get("data"), raw.get("samples") or {}
+            return raw, {}
     except Exception:
         pass
-    return None
+    return None, {}
 
 
-def save_cache(data: dict) -> None:
+def save_cache(data: dict, samples: dict) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        CACHE_FILE.write_text(
+            json.dumps({"data": data, "samples": samples}, ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
@@ -277,6 +284,26 @@ def fmt_span(span_s: int) -> str:
     return "%dM" % max(1, round(span_s / 60))
 
 
+def fmt_clock(ts: float) -> str:
+    """时间戳 → 紧凑时刻。今天只给 HH:MM，明天带前缀，更远给日期。"""
+    if not ts:
+        return "--"
+    try:
+        lt = time.localtime(ts)
+        now = time.localtime()
+        today0 = time.mktime(
+            (now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1)
+        )
+        days = int((ts - today0) // 86400)
+        if days == 0:
+            return time.strftime("%H:%M", lt)
+        if days == 1:
+            return time.strftime("明 %H:%M", lt)
+        return time.strftime("%m-%d", lt)
+    except Exception:
+        return "--"
+
+
 # ---------------------------------------------------------------- 窗口
 
 
@@ -284,7 +311,7 @@ class Gauge:
     def __init__(self, root: tk.Tk, cfg: dict):
         self.root = root
         self.cfg = cfg
-        self.data = load_cache()
+        self.data, self.samples = load_cache()
         self.error = None
         self.fetching = False
         self._drag = None
@@ -327,17 +354,18 @@ class Gauge:
         self.canvas.pack(fill="both", expand=True)
 
     def _initial_pos(self):
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
         pos = self.cfg.get("pos")
         if isinstance(pos, (list, tuple)) and len(pos) == 2:
             try:
                 x, y = int(pos[0]), int(pos[1])
-                sw = self.root.winfo_screenwidth()
-                sh = self.root.winfo_screenheight()
-                if -WIN_W < x < sw - 40 and -20 < y < sh - 40:
-                    return x, y
+                # 必须整块落在屏幕内，否则底部信息会被屏幕边缘切掉
+                x = max(0, min(x, sw - WIN_W))
+                y = max(0, min(y, sh - WIN_H))
+                return x, y
             except Exception:
                 pass
-        sw = self.root.winfo_screenwidth()
         return sw - WIN_W - 28, 28
 
     # -------------------------------------------------- 分层窗口（圆角 + 可变透明）
@@ -448,6 +476,11 @@ class Gauge:
             return
         x = e.x_root - self._drag[0]
         y = e.y_root - self._drag[1]
+        # 拖动时就把窗口夹在屏幕内，避免存下一个半出界的位置
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = max(0, min(x, sw - WIN_W))
+        y = max(0, min(y, sh - WIN_H))
         self.root.geometry("+%d+%d" % (x, y))
 
     def _on_release(self, _=None):
@@ -497,17 +530,17 @@ class Gauge:
         self.dot = cv.create_oval(16, 18, 23, 25, fill=C_OFFLINE, outline="")
         cv.create_text(32, 22, text="CODEX", anchor="w", fill=C_TITLE,
                        font=("Segoe UI Semibold", 9))
-        self.foot = cv.create_text(WIN_W / 2, 99, text="", fill=C_FOOT,
+        self.foot = cv.create_text(WIN_W / 2, 120, text="", fill=C_FOOT,
                                    font=("Microsoft YaHei UI", 8))
 
     def _row(self, y, label, win):
         cv = self.canvas
-        x1, x2 = 52, 190
+        x1, x2 = 52, 186
         cv.create_text(20, y, text=label, anchor="w", fill=C_DIM,
                        font=("Segoe UI Semibold", 8), tags="dyn")
         round_rect(cv, x1, y - 3, x2, y + 4, 3.5, fill=C_TRACK, outline="", tags="dyn")
         if not win:
-            cv.create_text(238, y, text="--", anchor="e", fill=C_DIM,
+            cv.create_text(240, y, text="--", anchor="e", fill=C_DIM,
                            font=("Segoe UI Semibold", 8), tags="dyn")
             return
         pct = max(0.0, min(100.0, win["used"]))
@@ -516,7 +549,7 @@ class Gauge:
         if bar_w >= 2:
             round_rect(cv, x1, y - 3, x1 + max(4, bar_w), y + 4, 3.5,
                        fill=color, outline="", tags="dyn")
-        cv.create_text(238, y, text="%d%%" % round(pct), anchor="e",
+        cv.create_text(240, y, text="%d%%" % round(pct), anchor="e",
                        fill=color, font=("Segoe UI Semibold", 8), tags="dyn")
 
     def _paint_data(self):
@@ -536,13 +569,39 @@ class Gauge:
         if plan and plan != "UNKNOWN":
             color = PLAN_COLORS.get(plan.lower(), "#3A4557")
             tw = max(30, len(plan) * 5.8 + 14)
-            round_rect(cv, 238 - tw, 15, 238, 29, 7, fill=color, outline="", tags="dyn")
-            cv.create_text(238 - tw / 2, 22, text=plan, fill="#FFFFFF",
+            round_rect(cv, 240 - tw, 15, 240, 29, 7, fill=color, outline="", tags="dyn")
+            cv.create_text(240 - tw / 2, 22, text=plan, fill="#FFFFFF",
                            font=("Segoe UI Semibold", 7), tags="dyn")
 
-        self._row(50, "5H", (d or {}).get("primary"))
-        self._row(74, "7D", (d or {}).get("secondary"))
+        primary = (d or {}).get("primary")
+        secondary = (d or {}).get("secondary")
+        self._row(50, "5H", primary)
+        self._row(74, "7D", secondary)
+        self._paint_forecast(primary, secondary)
         self._paint_foot()
+
+    def _paint_forecast(self, primary, secondary):
+        """预测行：按当前消耗速度，各自的窗口会不会在重置前打满。"""
+        cv = self.canvas
+        for tag, key, win, x, anchor in (
+            ("5H", "primary", primary, 20, "w"),
+            ("7D", "secondary", secondary, 240, "e"),
+        ):
+            text, color = self._forecast_label(tag, key, win)
+            cv.create_text(x, 98, text=text, anchor=anchor, fill=color,
+                           font=("Microsoft YaHei UI", 8), tags="dyn")
+
+    def _forecast_label(self, tag, key, win):
+        state, eta = self._forecast(key, win)
+        if state == "full":
+            return tag + " 已用尽", C_DANGER
+        if state == "unknown":
+            return tag + " 采样中", C_FOOT
+        if state == "safe":
+            return tag + " 不会打满", C_DIM
+        left = eta - time.time()
+        color = C_DANGER if left < 3600 else C_WARN
+        return "%s %s 打满" % (tag, fmt_clock(eta)), color
 
     def _paint_foot(self):
         if not hasattr(self, "foot"):
@@ -556,24 +615,55 @@ class Gauge:
         elif not d:
             text = "正在读取额度…"
         else:
-            now = time.time()
-            dead = [
-                lb for lb, w in (("5H", d.get("primary")), ("7D", d.get("secondary")))
-                if w and w["used"] >= 100
-            ]
-            if dead:
-                color = C_DANGER
-                w = d["primary"] if dead[0] == "5H" else d["secondary"]
-                left = w["reset_at"] - now
-                tail = fmt_delta(left) + " 后恢复" if left > 0 else "即将恢复"
-                text = "%s 已用尽 · %s" % (dead[0], tail)
-            else:
-                parts = []
-                for label, w in (("5H", d.get("primary")), ("7D", d.get("secondary"))):
-                    if w and w.get("reset_at"):
-                        parts.append("%s %s" % (label, fmt_delta(w["reset_at"] - now)))
-                text = "重置 " + "  ·  ".join(parts) if parts else "额度正常"
+            # 「用尽 / 打满」由上面的预测行负责，这里只交代重置时刻，避免重复
+            parts = []
+            for label, w in (("5H", d.get("primary")), ("7D", d.get("secondary"))):
+                if w and w.get("reset_at"):
+                    parts.append("%s %s" % (label, fmt_clock(w["reset_at"])))
+            text = "重置 " + " · ".join(parts) if parts else "额度正常"
         self.canvas.itemconfigure(self.foot, text=text, fill=color)
+
+    # -------------------------------------------------- 用量预测
+
+    def _record_sample(self, key, used, ts):
+        """记录一次采样。用量突降视为窗口已重置，清空历史重新计速。"""
+        arr = self.samples.setdefault(key, [])
+        if arr and used < arr[-1][1] - 5:
+            arr.clear()
+        arr.append([round(ts, 1), round(float(used), 2)])
+        if len(arr) > 40:
+            del arr[:-40]
+
+    def _rate(self, key):
+        """最近若干采样的消耗速度，单位 %/小时。采样不足或跨度过短返回 None。"""
+        arr = self.samples.get(key) or []
+        if len(arr) < 2:
+            return None
+        recent = arr[-6:]
+        t0, u0 = recent[0]
+        t1, u1 = recent[-1]
+        dt = t1 - t0
+        if dt < 45:  # 跨度太短，噪声压过信号
+            return None
+        return (u1 - u0) / (dt / 3600.0)
+
+    def _forecast(self, key, win):
+        """返回 (状态, 预计打满时间戳)。状态：full / safe / burn / unknown。"""
+        if not win:
+            return "unknown", None
+        used = win.get("used", 0)
+        if used >= 100:
+            return "full", None
+        rate = self._rate(key)
+        if rate is None:
+            return "unknown", None
+        if rate <= 0.02:  # 每小时不到 0.02%，等同于不消耗
+            return "safe", None
+        eta = time.time() + (100.0 - used) / rate * 3600.0
+        reset_at = win.get("reset_at") or 0
+        if reset_at and eta >= reset_at:
+            return "safe", None  # 重置先到，打不满
+        return "burn", eta
 
     # -------------------------------------------------- 刷新
 
@@ -596,7 +686,12 @@ class Gauge:
         self.fetching = False
         self.error = None
         self.data = data
-        save_cache(data)
+        now = time.time()
+        for key in ("primary", "secondary"):
+            win = data.get(key)
+            if win:
+                self._record_sample(key, win["used"], now)
+        save_cache(data, self.samples)
         self._paint_static()
         self._paint_data()
 

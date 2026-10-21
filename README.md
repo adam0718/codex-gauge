@@ -1,5 +1,9 @@
 # Codex Gauge · 额度悬浮窗
 
+[![Release](https://img.shields.io/github/v/release/adam0718/codex-gauge?color=7B61FF)](https://github.com/adam0718/codex-gauge/releases)
+[![Python](https://img.shields.io/badge/python-3.9%2B-3776AB)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-none-37D39A)](#)
+
 一个常驻桌面的极简悬浮窗，实时显示你 Codex 账号的额度消耗。
 
 鼠标移开时半透明淡出、几乎不占视线；鼠标移上去立刻恢复清晰。额度快见底时边框会变红提醒。

@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from ctypes import wintypes
 from pathlib import Path
 
 import tkinter as tk
@@ -48,6 +49,10 @@ CACHE_FILE = CONFIG_DIR / "cache.json"
 WIN_W, WIN_H = 252, 142
 CARD = (6, 6, 246, 136)
 CARD_R = 14
+
+# 紧凑条：贴在任务栏上沿，只占一条细缝
+COMPACT_W, COMPACT_H = 250, 30
+LAYOUTS = {"card": (WIN_W, WIN_H), "compact": (COMPACT_W, COMPACT_H)}
 
 # 魔术色：圆角之外的所有像素都会被系统抠掉
 KEY_COLOR_HEX = "#010203"
@@ -83,6 +88,7 @@ DEFAULT_CONFIG = {
     "rounded": True,
     "follow_codex": False,
     "active_account": None,
+    "layout": "card",
 }
 
 # ---------------------------------------------------------------- 配置
@@ -457,24 +463,48 @@ class Gauge:
 
     def _build_window(self):
         r = self.root
+        w, h = self._size()
         r.title("Codex Gauge")
         r.overrideredirect(True)
         r.attributes("-topmost", bool(self.cfg.get("always_on_top", True)))
         r.configure(bg=KEY_COLOR_HEX if self.cfg.get("rounded") else C_BG)
-        r.geometry("%dx%d+%d+%d" % (WIN_W, WIN_H, *self._initial_pos()))
+        r.geometry("%dx%d+%d+%d" % (w, h, *self._initial_pos()))
         r.resizable(False, False)
 
         self.canvas = tk.Canvas(
             r,
-            width=WIN_W,
-            height=WIN_H,
+            width=w,
+            height=h,
             bg=KEY_COLOR_HEX if self.cfg.get("rounded") else C_BG,
             highlightthickness=0,
             bd=0,
         )
         self.canvas.pack(fill="both", expand=True)
 
+    def _size(self):
+        return LAYOUTS.get(self.cfg.get("layout", "card"), LAYOUTS["card"])
+
+    def _is_compact(self) -> bool:
+        return self.cfg.get("layout") == "compact"
+
+    def _dock_pos(self):
+        """紧凑条的位置：贴着任务栏内侧（工作区底边），靠右。"""
+        w, h = self._size()
+        try:
+            r = wintypes.RECT()
+            # SPI_GETWORKAREA：不含任务栏的可用桌面区域
+            ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
+            if r.right > 0 and r.bottom > 0:
+                return max(0, r.right - w - 12), max(0, r.bottom - h - 6)
+        except Exception:
+            pass
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        return sw - w - 12, sh - 48 - h - 8
+
     def _initial_pos(self):
+        if self._is_compact():
+            return self._dock_pos()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         pos = self.cfg.get("pos")
@@ -553,6 +583,22 @@ class Gauge:
                             bd=0, font=("Microsoft YaHei UI", 9))
         self.menu.add_command(label="立即刷新", command=self.refresh)
         self.menu.add_command(label="重置位置", command=self._reset_pos)
+
+        self.layout_var = tk.StringVar(value=self.cfg.get("layout", "card"))
+        layout_menu = tk.Menu(
+            self.menu, tearoff=0, bg="#161C26", fg="#DDE5F2",
+            activebackground="#2A3446", activeforeground="#FFFFFF",
+            bd=0, font=("Microsoft YaHei UI", 9),
+        )
+        layout_menu.add_radiobutton(
+            label="卡片", value="card", variable=self.layout_var,
+            command=lambda: self._apply_layout("card"),
+        )
+        layout_menu.add_radiobutton(
+            label="任务栏细条", value="compact", variable=self.layout_var,
+            command=lambda: self._apply_layout("compact"),
+        )
+        self.menu.add_cascade(label="显示样式", menu=layout_menu)
         self.follow_var = tk.BooleanVar(value=bool(self.cfg.get("follow_codex")))
         self.menu.add_checkbutton(
             label="跟随 Codex 启动", variable=self.follow_var, command=self._toggle_follow
@@ -629,6 +675,20 @@ class Gauge:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
             self.menu.grab_release()
+
+    def _apply_layout(self, layout):
+        """在「卡片」和「任务栏细条」之间切换。"""
+        if layout == self.cfg.get("layout"):
+            return
+        self.cfg["layout"] = layout
+        save_config(self.cfg)
+        w, h = self._size()
+        x, y = self._initial_pos()
+        self.canvas.config(width=w, height=h)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self._paint_static()
+        self._paint_data()
+        self.root.after(60, self._maybe_idle)
 
     def _reset_pos(self):
         self.cfg["pos"] = None
@@ -715,6 +775,28 @@ class Gauge:
         )
         border = C_EDGE_ALERT if drained else C_BORDER
         rounded = self.cfg.get("rounded", True)
+        if self._is_compact():
+            self._paint_compact_static(border, rounded)
+        else:
+            self._paint_card_static(border, rounded)
+
+    def _paint_compact_static(self, border, rounded):
+        """紧凑条：只有两条细进度 + 百分比，高度 30px。
+
+        细条上整圈红框占比太大、太扎眼，用尽状态靠数字变红表达就够了。
+        """
+        cv = self.canvas
+        if rounded:
+            round_rect(cv, 1, 1, COMPACT_W - 1, COMPACT_H - 1, 8,
+                       fill=C_BG, outline=C_BORDER, width=1)
+        else:
+            cv.create_rectangle(1, 1, COMPACT_W - 1, COMPACT_H - 1,
+                                fill=C_BG, outline=C_BORDER, width=1)
+        self.dot = None
+        self.foot = None
+
+    def _paint_card_static(self, border, rounded):
+        cv = self.canvas
         if rounded:
             round_rect(cv, *CARD, CARD_R, fill=C_BG, outline=border, width=1)
         else:
@@ -746,6 +828,38 @@ class Gauge:
                        fill=color, font=("Segoe UI Semibold", 8), tags="dyn")
 
     def _paint_data(self):
+        if self._is_compact():
+            self._paint_compact_data()
+        else:
+            self._paint_card_data()
+
+    def _paint_compact_data(self):
+        cv = self.canvas
+        cv.delete("dyn")
+        d = self.data
+        self._compact_row(8, 28, 82, 86, "5H", (d or {}).get("primary"))
+        self._compact_row(126, 146, 200, 204, "7D", (d or {}).get("secondary"))
+
+    def _compact_row(self, x_label, x1, x2, x_pct, label, win):
+        cv = self.canvas
+        cy = COMPACT_H // 2
+        cv.create_text(x_label, cy, text=label, anchor="w", fill=C_DIM,
+                       font=("Segoe UI Semibold", 8), tags="dyn")
+        round_rect(cv, x1, cy - 3, x2, cy + 3, 3, fill=C_TRACK, outline="", tags="dyn")
+        if not win:
+            cv.create_text(x_pct, cy, text="--", anchor="w", fill=C_DIM,
+                           font=("Segoe UI Semibold", 8), tags="dyn")
+            return
+        pct = max(0.0, min(100.0, win["used"]))
+        color = level_color(pct)
+        bar_w = (x2 - x1) * pct / 100.0
+        if bar_w >= 2:
+            round_rect(cv, x1, cy - 3, x1 + max(4, bar_w), cy + 3, 3,
+                       fill=color, outline="", tags="dyn")
+        cv.create_text(x_pct, cy, text="%d%%" % round(pct), anchor="w",
+                       fill=color, font=("Segoe UI Semibold", 8), tags="dyn")
+
+    def _paint_card_data(self):
         cv = self.canvas
         cv.delete("dyn")
         d = self.data
@@ -797,7 +911,7 @@ class Gauge:
         return "%s %s 打满" % (tag, fmt_clock(eta)), color
 
     def _paint_foot(self):
-        if not hasattr(self, "foot"):
+        if not getattr(self, "foot", None):
             return
         d = self.data
         color = C_FOOT

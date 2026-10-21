@@ -362,10 +362,15 @@ def round_rect(cv, x1, y1, x2, y2, r, **kw):
     return cv.create_polygon(pts, smooth=True, **kw)
 
 
-def level_color(pct: float) -> str:
-    if pct >= 85:
+def level_color(remaining: float) -> str:
+    """按「还剩多少」给色：余额越少越危险。
+
+    注意语义：传进来的是**剩余**百分比，不是已用百分比。
+    阈值对应「已经用掉 85% / 55%」——余额过半就开始提醒。
+    """
+    if remaining <= 15:
         return C_DANGER
-    if pct >= 60:
+    if remaining <= 45:
         return C_WARN
     return C_OK
 
@@ -839,7 +844,8 @@ class Gauge:
             cv.create_rectangle(*CARD, fill=C_BG, outline=border, width=1)
 
         self.dot = cv.create_oval(16, 18, 23, 25, fill=C_OFFLINE, outline="")
-        cv.create_text(32, 22, text="CODEX", anchor="w", fill=C_TITLE,
+        # 标题带「余额」二字，避免把百分比误读成已用量
+        cv.create_text(32, 22, text="CODEX 余额", anchor="w", fill=C_TITLE,
                        font=("Segoe UI Semibold", 9))
         self.foot = cv.create_text(WIN_W / 2, 120, text="", fill=C_FOOT,
                                    font=("Microsoft YaHei UI", 8))
@@ -854,13 +860,14 @@ class Gauge:
             cv.create_text(240, y, text="--", anchor="e", fill=C_DIM,
                            font=("Segoe UI Semibold", 8), tags="dyn")
             return
-        pct = max(0.0, min(100.0, win["used"]))
-        color = level_color(pct)
-        bar_w = (x2 - x1) * pct / 100.0
+        # 展示「余额」而不是「已用」：条越长表示还能用越多，符合电量直觉
+        remain = max(0.0, min(100.0, 100.0 - win["used"]))
+        color = level_color(remain)
+        bar_w = (x2 - x1) * remain / 100.0
         if bar_w >= 2:
             round_rect(cv, x1, y - 3, x1 + max(4, bar_w), y + 4, 3.5,
                        fill=color, outline="", tags="dyn")
-        cv.create_text(240, y, text="%d%%" % round(pct), anchor="e",
+        cv.create_text(240, y, text="%d%%" % round(remain), anchor="e",
                        fill=color, font=("Segoe UI Semibold", 8), tags="dyn")
 
     def _paint_data(self):
@@ -886,13 +893,13 @@ class Gauge:
             cv.create_text(x_pct, cy, text="--", anchor="w", fill=C_DIM,
                            font=("Segoe UI Semibold", 8), tags="dyn")
             return
-        pct = max(0.0, min(100.0, win["used"]))
-        color = level_color(pct)
-        bar_w = (x2 - x1) * pct / 100.0
+        remain = max(0.0, min(100.0, 100.0 - win["used"]))
+        color = level_color(remain)
+        bar_w = (x2 - x1) * remain / 100.0
         if bar_w >= 2:
             round_rect(cv, x1, cy - 3, x1 + max(4, bar_w), cy + 3, 3,
                        fill=color, outline="", tags="dyn")
-        cv.create_text(x_pct, cy, text="%d%%" % round(pct), anchor="w",
+        cv.create_text(x_pct, cy, text="%d%%" % round(remain), anchor="w",
                        fill=color, font=("Segoe UI Semibold", 8), tags="dyn")
 
     def _paint_card_data(self):
@@ -900,15 +907,15 @@ class Gauge:
         cv.delete("dyn")
         d = self.data
 
-        # 状态点：取两个窗口里更紧张的那个；API Key 模式没有窗口，用灰点
+        # 状态点：取两个窗口里余额最少的那个；API Key 模式没有窗口，用灰点
         if d and d.get("mode") == "apikey":
             cv.itemconfigure(self.dot, fill=C_DIM)
         elif d:
-            used = max(
+            worst_used = max(
                 (d.get("primary") or {}).get("used", 0),
                 (d.get("secondary") or {}).get("used", 0),
             )
-            cv.itemconfigure(self.dot, fill=level_color(used))
+            cv.itemconfigure(self.dot, fill=level_color(100.0 - worst_used))
         else:
             cv.itemconfigure(self.dot, fill=C_OFFLINE)
 
@@ -944,14 +951,14 @@ class Gauge:
     def _forecast_label(self, tag, key, win):
         state, eta = self._forecast(key, win)
         if state == "full":
-            return tag + " 已用尽", C_DANGER
+            return tag + " 已耗尽", C_DANGER
         if state == "unknown":
             return tag + " 采样中", C_FOOT
         if state == "safe":
-            return tag + " 不会打满", C_DIM
+            return tag + " 余额充足", C_DIM
         left = eta - time.time()
         color = C_DANGER if left < 3600 else C_WARN
-        return "%s %s 打满" % (tag, fmt_clock(eta)), color
+        return "%s 约 %s 耗尽" % (tag, fmt_clock(eta)), color
 
     def _paint_foot(self):
         if not getattr(self, "foot", None):

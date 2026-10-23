@@ -19,6 +19,10 @@ Codex Gauge — Codex 额度悬浮窗
 数据来源：Codex CLI 登录凭证（~/.codex/auth.json）+ ChatGPT 官方用量接口。
 凭证只读、不落盘、不写回，刷新 token 的动作留给 Codex CLI 自己完成。
 
+另有一行可选的「Tibo 重置预测」：来自 codex-reset.com 的公开接口
+（跟踪 X 上 OpenAI/Codex 员工关于重置的发言），纯参考信号，
+失败时整行不显示，不影响额度主业。可在右键菜单里关掉。
+
 依赖：Python 3.9+ 标准库。零第三方依赖。
 """
 
@@ -32,6 +36,7 @@ import time
 import urllib.error
 import urllib.request
 from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
@@ -41,14 +46,21 @@ from tkinter import messagebox
 
 APP_NAME = "CodexGauge"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Tibo 重置预测：codex-reset.com 跟踪 X 上 @thsottiaux（OpenAI/Codex 员工）
+# 关于重置的发言，分类后给出「接下来 24h/48h 会不会重置」的公开 JSON 接口。
+TIBO_FORECAST_URL = "https://codex-reset.com/api/forecast?locale=zh"
+TIBO_MIN_INTERVAL = 120  # 秒：预测变化慢，不跟着用量刷新频率追，也照顾对方站点
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CACHE_FILE = CONFIG_DIR / "cache.json"
 
-WIN_W, WIN_H = 252, 142
-CARD = (6, 6, 246, 136)
+WIN_W, WIN_H = 252, 160
+CARD = (6, 6, 246, 154)
 CARD_R = 14
+
+# 卡片内各行基线：标题 22 / 5H 50 / 7D 74 / 速率预测 98 / Tibo 预测 118 / 脚注 140
+TIBO_Y = 118
 
 # 紧凑条：贴在任务栏上沿，只占一条细缝
 COMPACT_W, COMPACT_H = 250, 30
@@ -90,6 +102,7 @@ DEFAULT_CONFIG = {
     "follow_codex": False,
     "active_account": None,
     "layout": "card",
+    "show_tibo": True,
 }
 
 # ---------------------------------------------------------------- 配置
@@ -305,6 +318,120 @@ def normalize(payload: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- Tibo 重置预测
+#
+# 定位是「参考信号」，不是权威数据：
+#   - 来源是第三方站点 codex-reset.com 的公开接口，跟踪 X 上一位员工的发言
+#   - 接口挂了、改版了、网络不通，这一行就整行不显示，绝不影响额度主业
+#   - 不落盘、不随账号隔离——它本来就不是你的账号数据
+
+
+def _parse_ts(value) -> float:
+    """ISO8601（含 Z 后缀）→ Unix 时间戳；解析不了返回 0。"""
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _pct(value):
+    """概率字段 → 0..100 的整数；缺失或异常返回 None。"""
+    try:
+        if value is None:
+            return None
+        n = int(round(float(value)))
+    except Exception:
+        return None
+    return max(0, min(100, n))
+
+
+def normalize_tibo(payload) -> dict:
+    """把 /api/forecast 的响应收敛成浮窗要用的几个字段。
+
+    没有 probabilities 的一律返回 None——那是接口异常或改版，
+    与其显示错东西，不如不显示。
+    """
+    if not isinstance(payload, dict):
+        return None
+    probs = payload.get("probabilities")
+    if not isinstance(probs, dict):
+        return None
+    signal = payload.get("official_signal")
+    if not isinstance(signal, dict):
+        signal = {}
+    window = signal.get("window")
+    if not isinstance(window, dict):
+        window = {}
+    score = payload.get("signal_score")
+    if not isinstance(score, dict):
+        score = {}
+    return {
+        "mode": str(payload.get("mode") or ""),
+        "updated_at": _parse_ts(payload.get("updated_at")),
+        "prob_24h": _pct(probs.get("rounded_24h")),
+        "prob_48h": _pct(probs.get("rounded_48h")),
+        "band": str(score.get("band") or ""),
+        "tier": str(signal.get("signal_tier") or ""),
+        "target_at": _parse_ts(window.get("target_at")),
+        "label": str(window.get("localized_label") or window.get("label") or ""),
+        "summary": str(signal.get("localized_summary") or signal.get("summary") or ""),
+        "url": str(signal.get("url") or ""),
+        "fetched_at": time.time(),
+    }
+
+
+def fetch_tibo_forecast(timeout: float = 10) -> dict:
+    """拉一次 Tibo 重置预测。任何失败都返回 None，安静退场。"""
+    req = urllib.request.Request(
+        TIBO_FORECAST_URL,
+        headers={"Accept": "application/json", "User-Agent": "codex-gauge/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        return normalize_tibo(json.loads(raw))
+    except Exception:
+        return None
+
+
+def tibo_line(tibo, now=None):
+    """预测行文案：(左侧, 右侧, 颜色)。没有数据返回 (None, None, None)。
+
+    左侧讲「什么时候」，右侧讲「概率」。注意配色语义和余额告警是反的：
+    重置概率高是好事（额度要回来了），所以概率越高越往绿色靠。
+    """
+    if not tibo:
+        return None, None, None
+    now = time.time() if now is None else now
+    p24 = tibo.get("prob_24h")
+    p48 = tibo.get("prob_48h")
+    if p24 is not None and p48 is not None:
+        right = "24h %d%% · 48h %d%%" % (p24, p48)
+    elif p24 is not None:
+        right = "24h %d%%" % p24
+    else:
+        right = ""
+    target = tibo.get("target_at") or 0
+    if target > now:
+        left = "Tibo · 预测重置 %s" % fmt_clock(target)
+    else:
+        left = "Tibo · 下次信号待定"
+    if p24 is None:
+        color = C_FOOT
+    elif p24 >= 50:
+        color = C_OK
+    elif p24 >= 25:
+        color = C_WARN
+    else:
+        color = C_DIM
+    return left, right, color
+
+
 def load_cache(account_path=None):
     """返回 (data, samples)，按账号隔离，切换账号不会串数据。"""
     key = str(account_path or CODEX_HOME)
@@ -478,6 +605,9 @@ class Gauge:
         self.account_path = self._resolve_account()
         self.data, self.samples = load_cache(self.account_path)
         self.error = None
+        self.tibo = None            # Tibo 重置预测（第三方参考信号，可失败）
+        self._tibo_at = 0.0         # 上次拉取时间，用于节流
+        self._tibo_fetching = False
         self.fetching = False
         self._drag = None
         self._idle_job = None
@@ -643,6 +773,10 @@ class Gauge:
         self.follow_var = tk.BooleanVar(value=bool(self.cfg.get("follow_codex")))
         self.menu.add_checkbutton(
             label="跟随 Codex 启动", variable=self.follow_var, command=self._toggle_follow
+        )
+        self.tibo_var = tk.BooleanVar(value=bool(self.cfg.get("show_tibo", True)))
+        self.menu.add_checkbutton(
+            label="Tibo 重置预测", variable=self.tibo_var, command=self._toggle_tibo
         )
 
         self.account_var = tk.StringVar(value=self.account_path)
@@ -847,7 +981,7 @@ class Gauge:
         # 标题带「余额」二字，避免把百分比误读成已用量
         cv.create_text(32, 22, text="CODEX 余额", anchor="w", fill=C_TITLE,
                        font=("Segoe UI Semibold", 9))
-        self.foot = cv.create_text(WIN_W / 2, 120, text="", fill=C_FOOT,
+        self.foot = cv.create_text(WIN_W / 2, 140, text="", fill=C_FOOT,
                                    font=("Microsoft YaHei UI", 8))
 
     def _row(self, y, label, win):
@@ -933,6 +1067,7 @@ class Gauge:
         self._row(50, "5H", primary)
         self._row(74, "7D", secondary)
         self._paint_forecast(primary, secondary)
+        self._paint_tibo()
         self._paint_foot()
 
     def _paint_forecast(self, primary, secondary):
@@ -959,6 +1094,21 @@ class Gauge:
         left = eta - time.time()
         color = C_DANGER if left < 3600 else C_WARN
         return "%s 约 %s 耗尽" % (tag, fmt_clock(eta)), color
+
+    def _paint_tibo(self):
+        """Tibo 重置预测行：卡片专属，细条放不下就不画。"""
+        if self._is_compact() or not self.cfg.get("show_tibo", True):
+            return
+        cv = self.canvas
+        cv.delete("tibo")
+        left, right, color = tibo_line(self.tibo)
+        if not left:
+            return
+        cv.create_text(20, TIBO_Y, text=left, anchor="w", fill=C_FOOT,
+                       font=("Microsoft YaHei UI", 8), tags=("dyn", "tibo"))
+        if right:
+            cv.create_text(240, TIBO_Y, text=right, anchor="e", fill=color,
+                           font=("Microsoft YaHei UI", 8), tags=("dyn", "tibo"))
 
     def _paint_foot(self):
         if not getattr(self, "foot", None):
@@ -1101,6 +1251,7 @@ class Gauge:
         if self.fetching:
             return
         self.fetching = True
+        self._maybe_fetch_tibo()
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
@@ -1141,6 +1292,44 @@ class Gauge:
     def _auto_refresh(self):
         self.refresh()
         self._schedule_refresh()
+
+    # -------------------------------------------------- Tibo 重置预测
+
+    def _maybe_fetch_tibo(self):
+        """按节流节奏拉 Tibo 预测；开关关着或刚拉过就跳过。"""
+        if not self.cfg.get("show_tibo", True) or self._tibo_fetching:
+            return
+        if time.time() - self._tibo_at < TIBO_MIN_INTERVAL:
+            return
+        self._tibo_at = time.time()
+        self._tibo_fetching = True
+
+        def run():
+            try:
+                tibo = fetch_tibo_forecast()
+                self.root.after(0, lambda t=tibo: self._on_tibo(t))
+            finally:
+                self._tibo_fetching = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_tibo(self, tibo):
+        self.tibo = tibo
+        if not self._is_compact():
+            self._paint_tibo()
+
+    def _toggle_tibo(self):
+        on = bool(self.tibo_var.get())
+        self.cfg["show_tibo"] = on
+        save_config(self.cfg)
+        if on:
+            self._tibo_at = 0.0  # 重新打开就立刻拉一次，不用等下一个节流窗
+            self._maybe_fetch_tibo()
+        else:
+            try:
+                self.canvas.delete("tibo")
+            except Exception:
+                pass
 
     def _tick(self):
         """每秒只更新倒计时文字，不重绘，避免闪烁。"""
